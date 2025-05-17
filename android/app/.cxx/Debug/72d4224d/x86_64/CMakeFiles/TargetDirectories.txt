@@ -1,0 +1,2 @@
+E:/pose_detector_app/android/app/.cxx/Debug/72d4224d/x86_64/CMakeFiles/edit_cache.dir
+E:/pose_detector_app/android/app/.cxx/Debug/72d4224d/x86_64/CMakeFiles/rebuild_cache.dir
