@@ -2,39 +2,39 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:battery_plus/battery_plus.dart';
-import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
+import 'package:camera/camera.dart' as material;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' as material;
+import 'package:flutter/services.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:system_info2/system_info2.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:flutter_isolate/flutter_isolate.dart';
+import 'package:vector_math/vector_math_64.dart';
 
 void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+  material.WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   await _requestCameraPermission();
   final cameras = await availableCameras();
-  runApp(MyApp(cameras: cameras));
+  material.runApp(MyApp(cameras: cameras));
 }
 
 Future<void> _requestCameraPermission() async {
-  var status = await Permission.camera.status;
-  if (!status.isGranted) {
+  if (!await Permission.camera.status.isGranted) {
     await Permission.camera.request();
   }
 }
 
-class MyApp extends StatelessWidget {
+class MyApp extends material.StatelessWidget {
   final List<CameraDescription> cameras;
-  const MyApp({Key? key, required this.cameras}) : super(key: key);
+  const MyApp({super.key, required this.cameras});
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      theme: ThemeData.dark(),
+  material.Widget build(material.BuildContext context) {
+    return material.MaterialApp(
+      theme: material.ThemeData.dark(),
       debugShowCheckedModeBanner: false,
       showPerformanceOverlay: true,
       home: PoseDetectionScreen(cameras: cameras),
@@ -42,61 +42,93 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class PoseDetectionScreen extends StatefulWidget {
+// Enhanced exponential smoother with adaptive alpha
+class PoseSmoother {
+  final Map<PoseLandmarkType, Vector2> previousLandmarks = {};
+  final Map<PoseLandmarkType, Vector2> velocities = {};
+  final double baseAlpha;
+  final double minAlpha;
+  final bool enabled;
+
+  PoseSmoother({
+    this.baseAlpha = 0.4,
+    this.minAlpha = 0.1,
+    required this.enabled,
+  });
+
+  List<PoseLandmark> smoothPose(Map<PoseLandmarkType, PoseLandmark> landmarksMap) {
+    if (!enabled) return landmarksMap.values.toList();
+
+    final smoothedLandmarks = <PoseLandmark>[];
+    final stopwatch = Stopwatch()..start();
+
+    for (var landmark in landmarksMap.values) {
+      final type = landmark.type;
+      final currentPos = Vector2(landmark.x, landmark.y);
+
+      final likelihood = landmark.likelihood.clamp(0.1, 1.0);
+      final adaptiveAlpha = minAlpha + (baseAlpha - minAlpha) * likelihood;
+
+      previousLandmarks.putIfAbsent(type, () => currentPos);
+      velocities.putIfAbsent(type, () => Vector2.zero());
+
+      final prevPos = previousLandmarks[type]!;
+      final prevVelocity = velocities[type]!;
+      final smoothedPos = prevPos * (1 - adaptiveAlpha) + currentPos * adaptiveAlpha;
+      final velocity = (smoothedPos - prevPos) * 60.0;
+      velocities[type] = velocity;
+      previousLandmarks[type] = smoothedPos;
+      smoothedLandmarks.add(PoseLandmark(
+        type: type,
+        x: smoothedPos.x,
+        y: smoothedPos.y,
+        z: landmark.z,
+        likelihood: landmark.likelihood,
+      ));
+    }
+
+    stopwatch.stop();
+    PerformanceTracker().log(
+        'Экспоненциальное сглаживание: ${stopwatch.elapsedMicroseconds / 1000.0} мс');
+
+    return smoothedLandmarks;
+  }
+}
+
+enum SmoothingMode { none, exponential }
+
+class PoseDetectionScreen extends material.StatefulWidget {
   final List<CameraDescription> cameras;
-  const PoseDetectionScreen({Key? key, required this.cameras}) : super(key: key);
+  const PoseDetectionScreen({super.key, required this.cameras});
 
   @override
   _PoseDetectionScreenState createState() => _PoseDetectionScreenState();
 }
 
-class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
+class _PoseDetectionScreenState extends material.State<PoseDetectionScreen> {
   late CameraController _controller;
   late PoseDetector _poseDetector;
   late PerformanceTracker _performanceTracker;
+  late PoseSmoother _poseSmoother;
   bool _isProcessing = false;
   List<Pose> _poses = [];
-  String _debugInfo = 'Initializing...';
+  String _debugInfo = 'Инициализация...';
   bool _useAccurateModel = false;
   ResolutionPreset _resolution = ResolutionPreset.low;
   bool _showDebugFrame = true;
   int _cameraIndex = 0;
-  late File _logFile;
-  Timer? _logTimer;
+  SmoothingMode _smoothingMode = SmoothingMode.none;
 
-  // Метод для получения yOffset в зависимости от разрешения
-  double get yOffset {
-    switch (_resolution) {
-      case ResolutionPreset.low:
-        return -150.0;
-      case ResolutionPreset.high:
-        return -70.0;
-      default:
-        return -70.0;
-    }
-  }
+  double get yOffset => _resolution == ResolutionPreset.low ? -150.0 : -70.0;
 
   @override
   void initState() {
     super.initState();
-    _initializeLogFile();
+    _performanceTracker = PerformanceTracker();
     _initializeCamera();
     _initializePoseDetector();
-    _performanceTracker = PerformanceTracker(_logToFile);
-    _logTimer = Timer.periodic(Duration(seconds: 30), (timer) {
-      _performanceTracker.logMetrics();
-    });
-  }
-
-  Future<void> _initializeLogFile() async {
-    final directory = await getTemporaryDirectory();
-    _logFile = File('${directory.path}/pose_detection_log.txt');
-    await _logFile.writeAsString('Pose Detection Log\n');
-  }
-
-  Future<void> _logToFile(String message) async {
-    final timestamp = DateTime.now().toIso8601String();
-    await _logFile.writeAsString('[$timestamp] $message\n', mode: FileMode.append);
+    _poseSmoother = PoseSmoother(enabled: _smoothingMode == SmoothingMode.exponential);
+    Timer.periodic(Duration(seconds: 30), (_) => _performanceTracker.logMetrics(_smoothingMode));
   }
 
   Future<void> _initializeCamera() async {
@@ -105,11 +137,11 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       await _controller.initialize();
       if (!mounted) return;
       await _controller.startImageStream(_processCameraImage);
-      await _logToFile('Camera initialized: ${_controller.description.name}');
-      setState(() => _debugInfo = 'Camera initialized');
+      _performanceTracker.log('Камера инициализирована: ${_controller.description.name}');
+      setState(() => _updateDebugInfo());
     } catch (e) {
-      await _logToFile('Camera error: $e');
-      setState(() => _debugInfo = 'Camera error: $e');
+      _performanceTracker.log('Ошибка камеры: $e');
+      setState(() => _debugInfo = 'Ошибка камеры: $e');
     }
   }
 
@@ -122,12 +154,23 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     );
   }
 
+  void _updateDebugInfo() {
+    final camera = widget.cameras[_cameraIndex];
+    final cameraName = camera.lensDirection == CameraLensDirection.front ? 'Передняя' : 'Задняя';
+    final previewSize = _controller.value.previewSize;
+    final resolutionStr = previewSize != null
+        ? '${previewSize.width.toInt()}×${previewSize.height.toInt()}'
+        : 'Неизвестно';
+    _debugInfo =
+    'Камера: $cameraName\nРазрешение: $resolutionStr\nРежим: $_smoothingMode\nПоз: ${_poses.length}, Кадр: ${(_performanceTracker.lastFrameTime ?? 0.0).toStringAsFixed(2)} мс, FPS: ${(_performanceTracker.lastFps ?? 0.0).toStringAsFixed(2)}\nJitter: ${(_performanceTracker.lastJitter ?? 0.0).toStringAsFixed(2)} px, Latency: ${(_performanceTracker.lastLatency ?? 0.0).toStringAsFixed(2)} мс';
+  }
+
   Future<void> _processCameraImage(CameraImage image) async {
     if (_isProcessing) return;
-
     _isProcessing = true;
-    final stopwatch = Stopwatch()..start();
 
+    final frameStartTime = DateTime.now();
+    final stopwatch = Stopwatch()..start();
     try {
       final inputImage = await compute(_convertCameraImage, {
         'image': image,
@@ -135,24 +178,29 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       });
 
       final poses = await _poseDetector.processImage(inputImage);
-      await _logToFile('Processed frame, poses detected: ${poses.length}');
+      final smoothedPoses = poses.map((pose) {
+        final smoothedLandmarks = _poseSmoother.smoothPose(pose.landmarks);
+        return Pose(landmarks: {for (var lm in smoothedLandmarks) lm.type: lm});
+      }).toList();
 
       stopwatch.stop();
       final frameTime = stopwatch.elapsedMilliseconds.toDouble();
       final fps = frameTime > 0 ? 1000.0 / frameTime : 0.0;
+      final latency = DateTime.now().difference(frameStartTime).inMilliseconds.toDouble();
+
+      _performanceTracker.recordFrameTime(frameTime, fps, latency, _poseSmoother.velocities, _smoothingMode);
+      _performanceTracker.log('Обработан кадр, поз: ${poses.length}, режим: $_smoothingMode');
 
       setState(() {
-        _poses = poses;
-        _debugInfo = 'Poses: ${poses.length}, Frame time: ${frameTime.toStringAsFixed(2)} ms, FPS: ${fps.toStringAsFixed(2)}, yOffset: $yOffset';
+        _poses = smoothedPoses;
+        _updateDebugInfo();
       });
-
-      _performanceTracker.recordFrameTime(frameTime);
     } catch (e) {
-      await _logToFile('Error processing frame: $e');
-      setState(() => _debugInfo = 'Error: $e');
+      _performanceTracker.log('Ошибка обработки кадра: $e');
+      setState(() => _debugInfo = 'Ошибка: $e');
+    } finally {
+      _isProcessing = false;
     }
-
-    _isProcessing = false;
   }
 
   static InputImage _convertCameraImage(Map<String, dynamic> args) {
@@ -192,77 +240,104 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     _cameraIndex = (_cameraIndex + 1) % widget.cameras.length;
     await _controller.dispose();
     await _initializeCamera();
-    setState(() {});
+    setState(() => _updateDebugInfo());
   }
 
   Future<void> _updateSettings({
     bool? useAccurateModel,
     ResolutionPreset? resolution,
     bool? showDebugFrame,
+    SmoothingMode? smoothingMode,
   }) async {
     if (useAccurateModel != null) {
       _useAccurateModel = useAccurateModel;
-      _poseDetector.close();
+      await _poseDetector.close();
       _initializePoseDetector();
-      await _logToFile('Pose detector model changed to: ${_useAccurateModel ? "accurate" : "base"}');
+      _performanceTracker.log('Модель: ${_useAccurateModel ? "точная" : "базовая"}');
     }
     if (resolution != null) {
       _resolution = resolution;
       await _controller.dispose();
       await _initializeCamera();
-      await _logToFile('Camera resolution changed to: $resolution');
+      _performanceTracker.log('Разрешение: $resolution');
     }
     if (showDebugFrame != null) {
       _showDebugFrame = showDebugFrame;
-      await _logToFile('Debug frame visibility changed to: $showDebugFrame');
+      _performanceTracker.log('Отладочный кадр: $showDebugFrame');
     }
-    setState(() {});
+    if (smoothingMode != null) {
+      _smoothingMode = smoothingMode;
+      _poseSmoother = PoseSmoother(enabled: smoothingMode == SmoothingMode.exponential);
+      _performanceTracker.log('Режим сглаживания: $smoothingMode');
+    }
+    setState(() => _updateDebugInfo());
   }
 
   void _showSettingsDialog() {
-    showDialog(
+    material.showDialog(
       context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('Настройки'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
+      builder: (context) => material.AlertDialog(
+        title: const material.Text('Настройки'),
+        content: material.SingleChildScrollView(
+          child: material.Column(
+            mainAxisSize: material.MainAxisSize.min,
             children: [
-              SwitchListTile(
-                title: const Text('Точная модель'),
+              material.SwitchListTile(
+                title: const material.Text('Точная модель'),
                 value: _useAccurateModel,
                 onChanged: (val) {
-                  Navigator.pop(context);
+                  material.Navigator.pop(context);
                   _updateSettings(useAccurateModel: val);
                 },
               ),
-              SwitchListTile(
-                title: const Text('Показать отладку'),
+              material.SwitchListTile(
+                title: const material.Text('Показать отладку'),
                 value: _showDebugFrame,
                 onChanged: (val) {
-                  Navigator.pop(context);
+                  material.Navigator.pop(context);
                   _updateSettings(showDebugFrame: val);
                 },
               ),
-              DropdownButton<ResolutionPreset>(
+              material.DropdownButton<ResolutionPreset>(
                 value: _resolution,
-                items: [ResolutionPreset.low, ResolutionPreset.high].map((res) {
-                  return DropdownMenuItem(
-                    value: res,
-                    child: Text(res.toString().split('.').last),
-                  );
-                }).toList(),
+                items: [ResolutionPreset.low, ResolutionPreset.high]
+                    .map((res) => material.DropdownMenuItem(
+                  value: res,
+                  child: material.Text(res.toString().split('.').last),
+                ))
+                    .toList(),
                 onChanged: (val) {
                   if (val != null) {
-                    Navigator.pop(context);
+                    material.Navigator.pop(context);
                     _updateSettings(resolution: val);
+                  }
+                },
+              ),
+              material.DropdownButton<SmoothingMode>(
+                value: _smoothingMode,
+                items: SmoothingMode.values
+                    .map((mode) => material.DropdownMenuItem(
+                  value: mode,
+                  child: material.Text(mode.toString().split('.').last),
+                ))
+                    .toList(),
+                onChanged: (val) {
+                  if (val != null) {
+                    material.Navigator.pop(context);
+                    _updateSettings(smoothingMode: val);
                   }
                 },
               ),
             ],
           ),
-        );
-      },
+        ),
+        actions: [
+          material.TextButton(
+            onPressed: () => material.Navigator.pop(context),
+            child: const material.Text('Закрыть'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -270,54 +345,52 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   void dispose() {
     _controller.dispose();
     _poseDetector.close();
-    _logTimer?.cancel();
     _performanceTracker.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) {
+  material.Widget build(material.BuildContext context) {
     if (!_controller.value.isInitialized) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const material.Scaffold(body: material.Center(child: material.CircularProgressIndicator()));
     }
 
-    final size = MediaQuery.of(context).size;
+    final size = material.MediaQuery.of(context).size;
     final frameWidth = size.width;
-    const frameOffset = 0.0;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Pose Detector'),
+    return material.Scaffold(
+      appBar: material.AppBar(
+        title: const material.Text('Детектор поз'),
         actions: [
-          IconButton(
-            icon: Icon(Icons.flash_on, color: _useAccurateModel ? Colors.grey : Colors.white),
-            onPressed: () {
-              _updateSettings(useAccurateModel: false);
-            },
+          material.IconButton(
+            icon: material.Icon(material.Icons.flash_on,
+                color: _useAccurateModel ? material.Colors.grey : material.Colors.white),
+            onPressed: () => _updateSettings(useAccurateModel: false),
           ),
-          IconButton(
-            icon: Icon(Icons.center_focus_strong, color: _useAccurateModel ? Colors.white : Colors.grey),
-            onPressed: () {
-              _updateSettings(useAccurateModel: true);
-            },
+          material.IconButton(
+            icon: material.Icon(material.Icons.center_focus_strong,
+                color: _useAccurateModel ? material.Colors.white : material.Colors.grey),
+            onPressed: () => _updateSettings(useAccurateModel: true),
           ),
-          IconButton(icon: const Icon(Icons.cameraswitch), onPressed: _switchCamera),
-          IconButton(icon: const Icon(Icons.settings), onPressed: _showSettingsDialog),
+          material.IconButton(
+              icon: const material.Icon(material.Icons.cameraswitch), onPressed: _switchCamera),
+          material.IconButton(
+              icon: const material.Icon(material.Icons.settings), onPressed: _showSettingsDialog),
         ],
       ),
-      body: Stack(
+      body: material.Stack(
         children: [
-          CameraPreview(_controller),
-          Positioned(
-            right: frameOffset,
+          material.CameraPreview(_controller),
+          material.Positioned(
+            right: 0,
             top: 10,
             bottom: 10,
-            child: Container(
+            child: material.Container(
               width: frameWidth,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.green, width: 2),
+              decoration: material.BoxDecoration(
+                border: material.Border.all(color: material.Colors.green, width: 2),
               ),
-              child: CustomPaint(
+              child: material.CustomPaint(
                 painter: SkeletonPainter(
                   poses: _poses,
                   imageSize: Size(
@@ -327,20 +400,19 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
                   frameSize: size,
                   yOffset: yOffset,
                 ),
-                child: Container(),
               ),
             ),
           ),
           if (_showDebugFrame)
-            Positioned(
+            material.Positioned(
               bottom: 10,
               left: 10,
-              child: Container(
-                color: Colors.black54,
-                padding: const EdgeInsets.all(8),
-                child: Text(
+              child: material.Container(
+                color: material.Colors.black54,
+                padding: const material.EdgeInsets.all(8),
+                child: material.Text(
                   _debugInfo,
-                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                  style: const material.TextStyle(color: material.Colors.white, fontSize: 14),
                 ),
               ),
             ),
@@ -350,7 +422,7 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   }
 }
 
-class SkeletonPainter extends CustomPainter {
+class SkeletonPainter extends material.CustomPainter {
   final List<Pose> poses;
   final Size imageSize;
   final Size frameSize;
@@ -364,19 +436,19 @@ class SkeletonPainter extends CustomPainter {
   });
 
   @override
-  void paint(Canvas canvas, Size size) {
-    final pointPaint = Paint()
-      ..color = Colors.red
-      ..style = PaintingStyle.fill;
+  void paint(material.Canvas canvas, Size size) {
+    final pointPaint = material.Paint()
+      ..color = material.Colors.red
+      ..style = material.PaintingStyle.fill;
 
-    final linePaint = Paint()
-      ..color = Colors.blue
-      ..style = PaintingStyle.stroke
+    final linePaint = material.Paint()
+      ..color = material.Colors.blue
+      ..style = material.PaintingStyle.stroke
       ..strokeWidth = 2;
 
     for (final pose in poses) {
       final landmarks = pose.landmarks;
-      final Map<PoseLandmarkType, Offset> scaledPoints = {};
+      final Map<PoseLandmarkType, material.Offset> scaledPoints = {};
 
       landmarks.forEach((type, landmark) {
         final scaleX = frameSize.width / imageSize.width;
@@ -386,7 +458,7 @@ class SkeletonPainter extends CustomPainter {
         final dx = (frameSize.width - imageSize.width * scale) / 2;
         final dy = (frameSize.height - imageSize.height * scale) / 2 + yOffset;
 
-        final point = Offset(
+        final point = material.Offset(
           landmark.x * scale + dx,
           landmark.y * scale + dy,
         );
@@ -397,7 +469,7 @@ class SkeletonPainter extends CustomPainter {
         canvas.drawCircle(point, 5, pointPaint);
       });
 
-      final connections = [
+      const List<(PoseLandmarkType, PoseLandmarkType)> connections = [
         (PoseLandmarkType.leftShoulder, PoseLandmarkType.rightShoulder),
         (PoseLandmarkType.leftShoulder, PoseLandmarkType.leftHip),
         (PoseLandmarkType.rightShoulder, PoseLandmarkType.rightHip),
@@ -414,81 +486,128 @@ class SkeletonPainter extends CustomPainter {
 
       for (final (startType, endType) in connections) {
         if (scaledPoints.containsKey(startType) && scaledPoints.containsKey(endType)) {
-          canvas.drawLine(
-            scaledPoints[startType]!,
-            scaledPoints[endType]!,
-            linePaint,
-          );
+          canvas.drawLine(scaledPoints[startType]!, scaledPoints[endType]!, linePaint);
         }
       }
     }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant material.CustomPainter oldDelegate) => true;
 }
 
 class PerformanceTracker {
   final Battery _battery = Battery();
-  final List<double> _frameTimes = [];
-  final List<double> _fpsValues = [];
-  final Function(String) _logCallback;
+  final Map<SmoothingMode, List<double>> _frameTimes = {
+    SmoothingMode.none: [],
+    SmoothingMode.exponential: [],
+  };
+  final Map<SmoothingMode, List<double>> _fpsValues = {
+    SmoothingMode.none: [],
+    SmoothingMode.exponential: [],
+  };
+  final Map<SmoothingMode, List<double>> _jitterValues = {
+    SmoothingMode.none: [],
+    SmoothingMode.exponential: [],
+  };
+  final Map<SmoothingMode, List<double>> _latencyValues = {
+    SmoothingMode.none: [],
+    SmoothingMode.exponential: [],
+  };
+  double? lastFrameTime;
+  double? lastFps;
+  double? lastJitter;
+  double? lastLatency;
+  late File _logFile;
 
-  PerformanceTracker(this._logCallback) {
-    FlutterError.onError = (FlutterErrorDetails details) {
-      print("❌ Flutter Error: ${details.exception}");
-      _logCallback("❌ Flutter Error: ${details.exception}");
-    };
+  PerformanceTracker() {
+    _initializeLogFile();
+    material.FlutterError.onError = (details) => log("❌ Ошибка Flutter: ${details.exception}");
   }
 
-  void recordFrameTime(double elapsedMs) {
-    _frameTimes.add(elapsedMs);
-    final fps = 1000.0 / elapsedMs;
-    _fpsValues.add(fps);
-    print("🖼️ Frame time: ${elapsedMs.toStringAsFixed(2)} ms, FPS: ${fps.toStringAsFixed(2)}");
+  Future<void> _initializeLogFile() async {
+    final directory = await getTemporaryDirectory();
+    _logFile = File('${directory.path}/pose_detection_log.txt');
+    await _logFile.writeAsString('Лог детектора поз\n');
   }
 
-  double get lastFps => _fpsValues.isNotEmpty ? _fpsValues.last : 0.0;
+  Future<void> log(String message) async {
+    final timestamp = DateTime.now().toIso8601String();
+    await _logFile.writeAsString('[$timestamp] $message\n', mode: FileMode.append);
+    print(message);
+  }
 
-  Future<void> logMetrics() async {
+  void recordFrameTime(
+      double elapsedMs,
+      double fps,
+      double latency,
+      Map<PoseLandmarkType, Vector2> velocities,
+      SmoothingMode mode) {
+    _frameTimes[mode]!.add(elapsedMs);
+    _fpsValues[mode]!.add(fps);
+    _latencyValues[mode]!.add(latency);
+
+    // Calculate jitter as average velocity magnitude across landmarks
+    double jitter = 0.0;
+    if (velocities.isNotEmpty) {
+      final velocityMagnitudes = velocities.values
+          .map((v) => math.sqrt(v.x * v.x + v.y * v.y))
+          .toList();
+      jitter = velocityMagnitudes.reduce((a, b) => a + b) / velocityMagnitudes.length;
+    }
+    _jitterValues[mode]!.add(jitter);
+
+    lastFrameTime = elapsedMs;
+    lastFps = fps;
+    lastJitter = jitter;
+    lastLatency = latency;
+
+    log("🖼️ Время кадра: ${elapsedMs.toStringAsFixed(2)} мс, FPS: ${fps.toStringAsFixed(2)}, "
+        "Jitter: ${jitter.toStringAsFixed(2)} px, Latency: ${latency.toStringAsFixed(2)} мс, Режим: $mode");
+  }
+
+  Future<void> logMetrics(SmoothingMode currentMode) async {
     await _logSystemUsage();
     await _logBatteryLevel();
-    _logAverageFPS();
-    _logAverageInferenceTime();
+    _logPerformanceSummary(currentMode);
   }
 
   Future<void> _logSystemUsage() async {
-    int totalMemory = SysInfo.getTotalPhysicalMemory();
-    int freeMemory = SysInfo.getFreePhysicalMemory();
-    double usedMB = (totalMemory - freeMemory) / (1024 * 1024);
-    String log = "🧠 RAM used: ${usedMB.toStringAsFixed(2)} MB";
-    print(log);
-    await _logCallback(log);
+    final totalMemory = SysInfo.getTotalPhysicalMemory();
+    final freeMemory = SysInfo.getFreePhysicalMemory();
+    final usedMB = (totalMemory - freeMemory) / (1024 * 1024);
+    log("🧠 Использовано ОЗУ: ${usedMB.toStringAsFixed(2)} МБ");
   }
 
   Future<void> _logBatteryLevel() async {
-    int batteryLevel = await _battery.batteryLevel;
-    String log = "🔋 Battery: $batteryLevel%";
-    print(log);
-    await _logCallback(log);
+    final batteryLevel = await _battery.batteryLevel;
+    log("🔋 Уровень заряда: $batteryLevel%");
   }
 
-  void _logAverageFPS() {
-    if (_fpsValues.isEmpty) return;
-    double avgFps = _fpsValues.reduce((a, b) => a + b) / _fpsValues.length;
-    String log = "🎯 Avg FPS: ${avgFps.toStringAsFixed(2)}";
-    print(log);
-    _logCallback(log);
-    _fpsValues.clear();
-  }
-
-  void _logAverageInferenceTime() {
-    if (_frameTimes.isEmpty) return;
-    double avgTime = _frameTimes.reduce((a, b) => a + b) / _frameTimes.length;
-    String log = "📊 Avg inference time: ${avgTime.toStringAsFixed(2)} ms";
-    print(log);
-    _logCallback(log);
-    _frameTimes.clear();
+  void _logPerformanceSummary(SmoothingMode currentMode) {
+    final summary = StringBuffer('📊 Сводка производительности (Режим: $currentMode)\n');
+    for (var mode in SmoothingMode.values) {
+      final times = _frameTimes[mode]!;
+      final fps = _fpsValues[mode]!;
+      final jitter = _jitterValues[mode]!;
+      final latency = _latencyValues[mode]!;
+      if (times.isNotEmpty) {
+        final avgTime = times.reduce((a, b) => a + b) / times.length;
+        final avgFps = fps.reduce((a, b) => a + b) / fps.length;
+        final avgJitter = jitter.reduce((a, b) => a + b) / jitter.length;
+        final avgLatency = latency.reduce((a, b) => a + b) / latency.length;
+        summary.writeln(
+            '${mode.toString().split('.').last}: Среднее время: ${avgTime.toStringAsFixed(2)} мс, '
+                'Средний FPS: ${avgFps.toStringAsFixed(2)}, '
+                'Средний Jitter: ${avgJitter.toStringAsFixed(2)} px, '
+                'Средняя Latency: ${avgLatency.toStringAsFixed(2)} мс');
+        times.clear();
+        fps.clear();
+        jitter.clear();
+        latency.clear();
+      }
+    }
+    log(summary.toString());
   }
 
   void dispose() {}
